@@ -67,29 +67,56 @@ BACKBONE3D:
 
 LOSS:
   TAL:
-    top_k  : 10
-    alpha  : 0.5
-    beta   : 6.0
-    radius : 2.5
-    soft_label : False
-
-    scale_cls_loss : 0.5
-    scale_box_loss : 7.5
-    scale_dfl_loss : 1.5
+    top_k: 20  # Increased for HD
+    alpha: 0.5
+    beta: 6.0
+    radius: 7.5  # Increased from 2.5 for HD
+    soft_label: False
+    scale_cls_loss: 1.5  # Adjusted for HD
+    scale_box_loss: 22.5 # Adjusted for HD (7.5 * 3)
+    scale_dfl_loss: 4.5  # Adjusted for HD
 
   SIMOTA:
-    top_k  : 10
-    gamma  : 0.5
-    radius : 2.5
-    mode   : balance
-    soft_label : True
+    top_k: 20  # Increased for HD
+    gamma: 0.5
+    radius: 7.5  # Increased for HD
+    mode: balance
+    soft_label: True
+    dynamic_k: True  # Enabled for HD
+    dynamic_top_k: 120  # Increased for HD (40 * 3)
+    scale_cls_loss: 1.5  # Adjusted for HD
+    scale_box_loss: 22.5 # Adjusted for HD
+    scale_dfl_loss: 4.5  # Adjusted for HD
+# Add backbone specific HD configurations
+BACKBONE2D:
+  YOLOv8:
+    ver: m
+    HD_CONFIG:
+      feature_channels: [256, 512, 1024]  # Adjusted for HD
+      stride_size: [8, 16, 32]
+      memory_efficient: true
 
-    dynamic_k     : False
-    dynamic_top_k : 40
+BACKBONE3D:
+  I3D:
+    HD_CONFIG:
+      temporal_stride: 2
+      spatial_stride: [2, 2, 2, 2]
+      memory_efficient: true
+  RESNEXT:
+    HD_CONFIG:
+      temporal_stride: 2
+      spatial_stride: [2, 2, 2, 2]
+      memory_efficient: true
 
-    scale_cls_loss : 0.5
-    scale_box_loss : 7.5
-    scale_dfl_loss : 1.5
+# Add fusion module HD configurations
+fusion_module: CFAM
+FUSION:
+  CFAM:
+    HD_CONFIG:
+      channels: [256, 512, 1024]
+      attention_reduction: 16
+      memory_efficient: true
+
 
 config_path       : config/ucf_config.yaml
 dataset           : ucf
@@ -103,19 +130,44 @@ mode              : decoupled
 interchannels     : [256, 256, 256]
 pretrain_path     : /home/manh/checkpoint/ucf24/E30/ema_epoch_7.pth
 data_root         : /home/manh/Datasets/UCF101-24/ucf242
-img_size          : 224
+img_size          : [1920, 1080]
 clip_length       : 16
-batch_size        : 8
-num_workers       : 6
-acc_grad          : 16
+batch_size        : 4
+num_workers       : 8
+acc_grad          : 8
 lr                : 0.0001
-weight_decay      : 0.0005
-max_step_warmup   : 500
+weight_decay      : 0.001
+max_step_warmup   : 1000
 adjustlr_schedule : [1, 2, 3, 4, 5]
-max_epoch         : 7
+max_epoch         : 10
 lr_decay          : 0.5
 save_folder       : weights/model_checkpoint
 sampling_rate     : 1
+
+# Memory management
+memory_efficient: true
+mixed_precision: true
+gradient_checkpointing: true
+
+# Data augmentation for HD
+DATA_AUG:
+  enabled: true
+  random_crop: [1920, 1080]
+  random_flip: true
+  random_rotate: [-5, 5]
+  color_jitter: 0.1
+  adaptive_resize: true
+
+# Validation settings
+val_batch_size: 2  # Reduced for HD
+val_interval: 1
+save_interval: 1
+
+# Hardware optimization
+cuda_benchmark: true
+cudnn_benchmark: true
+num_gpus: 1
+distributed: false
 
 
 idx2name:
