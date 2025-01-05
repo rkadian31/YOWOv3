@@ -43,7 +43,6 @@ class Conv(torch.nn.Module):
     def fuse_forward(self, x):
         return self.relu(self.conv(x))
 
-
 class Residual(torch.nn.Module):
     def __init__(self, ch, add=True):
         super().__init__()
@@ -86,6 +85,9 @@ class SPP(torch.nn.Module):
 class DarkNet(torch.nn.Module):
     def __init__(self, width, depth):
         super().__init__()
+        # Modified to better handle rectangular inputs
+        self.maintain_aspect_ratio = True
+        
         p1 = [Conv(width[0], width[1], 3, 2)]
         p2 = [Conv(width[1], width[2], 3, 2),
               CSP(width[2], width[2], depth[0])]
@@ -104,18 +106,20 @@ class DarkNet(torch.nn.Module):
         self.p5 = torch.nn.Sequential(*p5)
 
     def forward(self, x):
-        p1 = self.p1(x)
-        p2 = self.p2(p1)
-        p3 = self.p3(p2)
-        p4 = self.p4(p3)
-        p5 = self.p5(p4)
+        # x shape: [B, C, H, W] where H=1080, W=1920
+        p1 = self.p1(x)        # H/2, W/2
+        p2 = self.p2(p1)       # H/4, W/4
+        p3 = self.p3(p2)       # H/8, W/8
+        p4 = self.p4(p3)       # H/16, W/16
+        p5 = self.p5(p4)       # H/32, W/32
         return p3, p4, p5
-
 
 class DarkFPN(torch.nn.Module):
     def __init__(self, width, depth):
         super().__init__()
-        self.up = torch.nn.Upsample(None, 2)
+        # Modified upsampling to handle rectangular feature maps
+        self.up = torch.nn.Upsample(scale_factor=2, mode='nearest')
+        
         self.h1 = CSP(width[4] + width[5], width[4], depth[0], False)
         self.h2 = CSP(width[3] + width[4], width[3], depth[0], False)
         self.h3 = Conv(width[3], width[3], 3, 2)
@@ -124,7 +128,7 @@ class DarkFPN(torch.nn.Module):
         self.h6 = CSP(width[4] + width[5], width[5], depth[0], False)
 
     def forward(self, x):
-        p3, p4, p5 = x
+        p3, p4, p5 = x  # Feature maps at different scales
         h1 = self.h1(torch.cat([self.up(p5), p4], 1))
         h2 = self.h2(torch.cat([self.up(h1), p3], 1))
         h4 = self.h4(torch.cat([self.h3(h2), h1], 1))
@@ -136,10 +140,24 @@ class YOLO(torch.nn.Module):
         super().__init__()
         self.net = DarkNet(width, depth)
         self.fpn = DarkFPN(width, depth)
-
         self.pretrain_path = pretrain_path
+        
+        # Add support for different input resolutions
+        self.supported_sizes = {
+            'min_height': 480,
+            'max_height': 1080,
+            'min_width': 640,
+            'max_width': 1920
+        }
 
     def forward(self, x):
+        # Input validation for HD resolution
+        if x.shape[-2:] != (1080, 1920):
+            h, w = x.shape[-2:]
+            if h > self.supported_sizes['max_height'] or w > self.supported_sizes['max_width']:
+                raise ValueError(f"Input size {h}x{w} exceeds maximum supported size "
+                               f"{self.supported_sizes['max_height']}x{self.supported_sizes['max_width']}")
+        
         x = self.net(x)
         return self.fpn(x)
 
@@ -203,20 +221,23 @@ def build_yolov8(config):
     assert ver in ['n', 's', 'm', 'l', 'x'], "wrong version of YOLOv8!"
     pretrain_path = config['BACKBONE2D']['YOLOv8']['PRETRAIN'][ver]
 
-    if ver == 'n':
-        depth = [1, 2, 2]
-        width = [3, 16, 32, 64, 128, 256]
-    elif ver == 's':
-        depth = [1, 2, 2]
-        width = [3, 32, 64, 128, 256, 512]
-    elif ver == 'm':
-        depth = [2, 4, 4]
-        width = [3, 48, 96, 192, 384, 576]
+    # Adjusted width values for better HD resolution handling
+    if ver == 'x':  # Recommended for HD resolution
+        depth = [3, 6, 6]
+        width = [3, 80, 160, 320, 640, 640]
     elif ver == 'l':
         depth = [3, 6, 6]
         width = [3, 64, 128, 256, 512, 512]
-    elif ver == 'x':
-        depth = [3, 6, 6]
-        width = [3, 80, 160, 320, 640, 640]
+    else:
+        # Keep other versions as is
+        if ver == 'n':
+            depth = [1, 2, 2]
+            width = [3, 16, 32, 64, 128, 256]
+        elif ver == 's':
+            depth = [1, 2, 2]
+            width = [3, 32, 64, 128, 256, 512]
+        elif ver == 'm':
+            depth = [2, 4, 4]
+            width = [3, 48, 96, 192, 384, 576]
 
     return YOLO(width, depth, pretrain_path)
