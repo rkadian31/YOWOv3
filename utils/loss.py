@@ -8,6 +8,9 @@ import torch.nn.functional as F
 class TAL:
     def __init__(self, model, config):
         super().__init__()
+        if self.hd_scale:
+        if self.img_size[0] < 1920 or self.img_size[1] < 1080:
+            raise ValueError(f"Invalid HD dimensions: {self.img_size}. Expected at least 1920x1080")
         if hasattr(model, 'module'):
             model = model.module
 
@@ -20,11 +23,30 @@ class TAL:
         self.no = m.no
         self.device = device
 
+        # Add HD-specific parameters
+        self.hd_scale = config.get('hd_scale', True)  # Flag for HD scaling
+        self.max_boxes_hd = config.get('max_boxes_hd', 300)  # Increased for HD
+        self.img_size = config.get('img_size', (1920, 1080))  # HD default
+
+        self.radius = config['LOSS']['TAL']['radius']
+
+        # Adjust radius for HD resolution
+        if self.hd_scale:
+            base_radius = self.radius
+            aspect_ratio = self.img_size[0] / self.img_size[1]
+            self.radius = base_radius * math.sqrt(aspect_ratio)
+        
+        # Adjust loss scaling for HD
+        if self.hd_scale:
+            self.scale_cls_loss *= (self.img_size[0] * self.img_size[1]) / (640 * 640)
+            self.scale_box_loss *= (self.img_size[0] * self.img_size[1]) / (640 * 640)
+            self.scale_dfl_loss *= (self.img_size[0] * self.img_size[1]) / (640 * 640)
+
         # task aligned assigner
         self.top_k          = config['LOSS']['TAL']['top_k']
         self.alpha          = config['LOSS']['TAL']['alpha']
         self.beta           = config['LOSS']['TAL']['beta']
-        self.radius         = config['LOSS']['TAL']['radius']
+       
         self.scale_cls_loss = config['LOSS']['TAL']['scale_cls_loss']
         self.scale_box_loss = config['LOSS']['TAL']['scale_box_loss']
         self.scale_dfl_loss = config['LOSS']['TAL']['scale_dfl_loss']
@@ -58,7 +80,12 @@ class TAL:
 
 
         size = torch.tensor(x[0].shape[2:], dtype=pred_scores.dtype, device=self.device)
+        if self.hd_scale:
+            size = size * torch.tensor([self.img_size[0]/size[1], 
+                                      self.img_size[1]/size[0]], 
+                                     device=self.device)
         size = size * self.stride[0]
+
 
         anchor_points, stride_tensor = make_anchors(x, self.stride, 0.5)
 
@@ -207,7 +234,11 @@ class TAL:
         mask_in_gts = bbox_deltas.view(bs, n_boxes, anchors.shape[0], -1).amin(3).gt_(1e-9)
         
         # [1029]
-        radius = (stride_tensor * self.radius).squeeze(-1)
+        if self.hd_scale:
+            aspect_ratio = self.img_size[0] / self.img_size[1]
+            radius = (stride_tensor * self.radius * math.sqrt(aspect_ratio)).squeeze(-1)
+        else:
+            radius = (stride_tensor * self.radius).squeeze(-1)
 
         # # print(anchors.shape) #[1029, 2]
         # [B * nbox, 1, 2]
@@ -317,6 +348,14 @@ class TAL:
     @staticmethod
     def iou(box1, box2, eps=1e-7):
         # Returns Intersection over Union (IoU) of box1(1,4) to box2(n,4)
+        if self.hd_scale:
+        # Normalize coordinates for HD
+            box1 = box1.clone()
+            box2 = box2.clone()
+            box1[..., [0, 2]] /= self.img_size[0]
+            box1[..., [1, 3]] /= self.img_size[1]
+            box2[..., [0, 2]] /= self.img_size[0]
+            box2[..., [1, 3]] /= self.img_size[1]
 
         # Get the coordinates of bounding boxes
         b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
@@ -361,16 +400,33 @@ class SimOTA:
         self.no = m.no
         self.device = device
 
-        # task aligned assigner
-        self.top_k          = config['LOSS']['SIMOTA']['top_k']
-        self.radius         = config['LOSS']['SIMOTA']['radius']
+         # Add HD-specific parameters
+        self.hd_scale = config.get('hd_scale', True)
+        self.img_size = config.get('img_size', (1920, 1080))
+
+        self.dynamic_top_k = config['LOSS']['SIMOTA']['dynamic_top_k']
+        self.top_k = config['LOSS']['SIMOTA']['top_k']
+
+        # Adjust parameters for HD
+        if self.hd_scale:
+            self.dynamic_top_k = int(self.dynamic_top_k * 
+                                   (self.img_size[0] * self.img_size[1]) / (640 * 640))
+            self.top_k = int(self.top_k * 
+                            (self.img_size[0] * self.img_size[1]) / (640 * 640))
+            
+            # Adjust radius for HD aspect ratio
+            base_radius = self.radius
+            aspect_ratio = self.img_size[0] / self.img_size[1]
+            self.radius = base_radius * math.sqrt(aspect_ratio)
+
+        # task aligned assigner       
+        
         self.mode           = config['LOSS']['SIMOTA']['mode']
         self.scale_cls_loss = config['LOSS']['SIMOTA']['scale_cls_loss']
         self.scale_box_loss = config['LOSS']['SIMOTA']['scale_box_loss']
         self.scale_dfl_loss = config['LOSS']['SIMOTA']['scale_dfl_loss']
         self.gamma          = config['LOSS']['SIMOTA']['gamma']
-        self.dynamic_k      = config['LOSS']['SIMOTA']['dynamic_k']
-        self.dynamic_top_k  = config['LOSS']['SIMOTA']['dynamic_top_k']
+        self.dynamic_k      = config['LOSS']['SIMOTA']['dynamic_k']        
         self.soft_label     = config['LOSS']['SIMOTA']['soft_label']
         self.eps            = 1e-9
 
@@ -389,8 +445,10 @@ class SimOTA:
         self.project = torch.arange(self.dfl_ch, dtype=torch.float, device=device)
     #                                 img_idx + 4 corrdinate + nclass
     #                           [nbox, 1 + 4 + nclass]
+    
     def __call__(self, outputs, targets):
-
+        if self.hd_scale:
+        torch.cuda.empty_cache()  # Clear GPU cache before processing
         # [B, 4 * n_dfl_channel + num_classes, 14, 14]  (28, 14, 7)
         x = outputs[1] if isinstance(outputs, tuple) else outputs
 
@@ -759,8 +817,17 @@ class SimOTA:
     
 
 def build_loss(model, config):
+    # Add HD configuration
+    if config.get('img_size', (640, 640))[0] > 640:
+        config['hd_scale'] = True
+        
+        # Adjust loss parameters for HD
+        if config['loss'] == 'tal':
+            config['LOSS']['TAL']['radius'] *= math.sqrt(1920 * 1080 / (640 * 640))
+        elif config['loss'] == 'simota':
+            config['LOSS']['SIMOTA']['radius'] *= math.sqrt(1920 * 1080 / (640 * 640))
+    
     loss_type = config['loss']
-
     if loss_type == 'tal':
         return TAL(model, config)
     elif loss_type == 'simota':
