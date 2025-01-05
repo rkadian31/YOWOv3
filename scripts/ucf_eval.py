@@ -30,12 +30,21 @@ from utils.flops import get_info
 
 @torch.no_grad()
 def eval(config):
+    config['img_size'] = (1920, 1080)
+    batch_size = 8  # Reduced from 32 for HD resolution
 
     ###############################################
     dataset = build_dataset(config, phase='test')
     
-    dataloader = data.DataLoader(dataset, 32, False, collate_fn=collate_fn
-                                 , num_workers=6, pin_memory=True)
+    dataloader = data.DataLoader(
+        dataset, 
+        batch_size, 
+        False, 
+        collate_fn=collate_fn,
+        num_workers=6, 
+        pin_memory=True
+     )
+    
     
     model = build_yowov3(config)
     get_info(config, model)
@@ -68,8 +77,8 @@ def eval(config):
 
         targets = torch.cat(targets, dim=0).to("cuda")
 
-        height = config['img_size']
-        width  = config['img_size']
+        height = config['img_size'][1]  # 1080
+        width = config['img_size'][0]   # 1920
 
         # Inference
         outputs = model(batch_clip)
