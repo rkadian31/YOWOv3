@@ -1,3 +1,8 @@
+python
+
+Run
+
+Copy
 import torch
 import torch.nn as nn
 from model.fusion.CFAM import CFAMFusion
@@ -28,9 +33,12 @@ class Conv(torch.nn.Module):
 class ClassificationHead(nn.Module):
     def __init__(self, shape, num_classes):
         super().__init__()
+        # Adjusted to handle rectangular input
         self.predict = nn.Conv2d(shape[0], num_classes, kernel_size=(shape[1], shape[2]))
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
 
     def forward(self, x):
+        x = self.adaptive_pool(x)
         return self.predict(x)
 
 class ClassificationModel(torch.nn.Module):
@@ -43,6 +51,12 @@ class ClassificationModel(torch.nn.Module):
         self.freeze_bb2D = freeze_bb2D
         self.freeze_bb3D = freeze_bb3D
 
+        # Handle rectangular input size
+        if isinstance(img_size, (list, tuple)):
+            self.img_height, self.img_width = img_size
+        else:
+            self.img_height = self.img_width = img_size
+
         self.inter_channels_decoupled = interchannels[0] 
         self.inter_channels_fusion    = interchannels[1]
         self.inter_channels_detection = interchannels[2]
@@ -50,8 +64,9 @@ class ClassificationModel(torch.nn.Module):
         self.net2D = backbone2D
         self.net3D = backbone3D
 
-        dummy_img3D = torch.zeros(1, 3, 16, img_size, img_size)
-        dummy_img2D = torch.zeros(1, 3, img_size, img_size)
+        # Modified dummy tensors for rectangular input
+        dummy_img3D = torch.zeros(1, 3, 16, self.img_height, self.img_width)
+        dummy_img2D = torch.zeros(1, 3, self.img_height, self.img_width)
 
         out_2D = self.net2D(dummy_img2D)
         out_3D = self.net3D(dummy_img3D)
@@ -62,44 +77,39 @@ class ClassificationModel(torch.nn.Module):
         out_channels_3D = out_3D.shape[1]
 
         self.fusion = CFAMFusion(out_channels_2D, 
-                                 out_channels_3D, 
-                                 self.inter_channels_fusion, 
-                                 mode=self.mode)
+                                out_channels_3D, 
+                                self.inter_channels_fusion, 
+                                mode=self.mode)
         
-        #for x in out_2D:
-            #print(x.shape)
-        
-        self.head   = ClassificationHead([self.inter_channels_fusion, out_2D[-1].shape[2], out_2D[-1].shape[3]], num_classes)
+        self.head = ClassificationHead(
+            [self.inter_channels_fusion, 
+             out_2D[-1].shape[2], 
+             out_2D[-1].shape[3]], 
+            num_classes
+        )
 
         if pretrain_path is not None:
             self.load_pretrain(pretrain_path)
-        else : 
+        else: 
             self.net2D.load_pretrain()
             self.net3D.load_pretrain()
             self.init_conv2d()
         
-        if freeze_bb2D == True:
+        if freeze_bb2D:
             for param in self.net2D.parameters():
                 param.require_grad = False
             print("backbone2D freezed!")
         
-        if freeze_bb3D == True:
+        if freeze_bb3D:
             for param in self.net3D.parameters():
                 param.require_grad = False
             print("backbone3D freezed!")
 
     def forward(self, clips):
         key_frames = clips[:, :, -1, :, :]
-
         ft_2D = self.net2D(key_frames)
         ft_3D = self.net3D(clips).squeeze(2)
-        
-
         ft = self.fusion(ft_2D, ft_3D)
-
-        # [B, 4 + num_classes, 1029]
-        #import sys
-        #sys.exit()
         return self.head(ft[-1]).squeeze(-1).squeeze(-1)
     
     def load_pretrain(self, pretrain_yowov3):
@@ -147,7 +157,7 @@ def build_classificationmodel(config):
     interchannels = config['interchannels']
     mode          = config['mode']
     pretrain_path = config['pretrain_path']
-    img_size      = config['img_size']
+    img_size      = (1080, 1920)  # height, width
 
     try:
         freeze_bb2D   = config['freeze_bb2D']
@@ -171,7 +181,7 @@ if __name__ == "__main__":
     interchannels = [256, 256, 256]
     mode          = 'coupled'
     pretrain_path = None
-    img_size      = 224
+    img_size      = (1080, 1920)  # Modified for HD resolution
 
     try:
         freeze_bb2D   = config['freeze_bb2D']
@@ -183,6 +193,7 @@ if __name__ == "__main__":
     model = ClassificationModel(num_classes, backbone2D, backbone3D, interchannels, mode, img_size, pretrain_path,
                   freeze_bb2D, freeze_bb3D)
     
-    clip = torch.zeros((8, 3, 16, 224, 224))
+    # Test with HD resolution
+    clip = torch.zeros((8, 3, 16, 1080, 1920))
     out  = model(clip)
     print(out.shape)
