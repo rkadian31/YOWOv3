@@ -55,6 +55,12 @@ class YOWOv3(torch.nn.Module):
         self.freeze_bb2D = freeze_bb2D
         self.freeze_bb3D = freeze_bb3D
 
+        # Handle rectangular input
+        if isinstance(img_size, (list, tuple)):
+            self.img_height, self.img_width = img_size
+        else:
+            self.img_height = self.img_width = img_size
+
         self.inter_channels_decoupled = interchannels[0] 
         self.inter_channels_fusion    = interchannels[1]
         self.inter_channels_detection = interchannels[2]
@@ -62,8 +68,9 @@ class YOWOv3(torch.nn.Module):
         self.net2D = backbone2D
         self.net3D = backbone3D
 
-        dummy_img3D = torch.zeros(1, 3, 16, img_size, img_size)
-        dummy_img2D = torch.zeros(1, 3, img_size, img_size)
+        # Modified dummy tensors for rectangular input
+        dummy_img3D = torch.zeros(1, 3, 16, self.img_height, self.img_width)
+        dummy_img2D = torch.zeros(1, 3, self.img_height, self.img_width)
 
         out_2D = self.net2D(dummy_img2D)
         out_3D = self.net3D(dummy_img3D)
@@ -75,43 +82,37 @@ class YOWOv3(torch.nn.Module):
 
         if self.mode == 'decoupled':
             self.decoupled_head = DecoupleHead(self.inter_channels_decoupled, out_channels_2D)
-            # [[box, cls], [box, cls], [box, cls]]
             out_2D = self.decoupled_head(out_2D)
             out_channels_2D = [[x[0].shape[1], x[1].shape[1]] for x in out_2D]    
 
-
         self.fusion = CFAMFusion(out_channels_2D, 
-                                 out_channels_3D, 
-                                 self.inter_channels_fusion, 
-                                 mode=self.mode)
+                                out_channels_3D, 
+                                self.inter_channels_fusion, 
+                                mode=self.mode)
 
-        self.detection_head = DFLHead(num_classes, img_size,
-                                      self.inter_channels_detection, 
-                                      [self.inter_channels_fusion for x in range(len(out_channels_2D))], 
-                                      mode=self.mode)
-        self.detection_head.stride = torch.tensor([img_size / x[0].shape[-2] for x in out_2D])
-        self.stride = self.detection_head.stride
+        # Modified detection head initialization for rectangular input
+        self.detection_head = DFLHead(num_classes, (self.img_height, self.img_width),
+                                    self.inter_channels_detection, 
+                                    [self.inter_channels_fusion for x in range(len(out_channels_2D))], 
+                                    mode=self.mode)
+        
+        # Modified stride calculation for rectangular input
+        self.detection_head.stride_height = torch.tensor([self.img_height / x[0].shape[-2] for x in out_2D])
+        self.detection_head.stride_width = torch.tensor([self.img_width / x[0].shape[-1] for x in out_2D])
+        self.stride = (self.detection_head.stride_height, self.detection_head.stride_width)
 
+        # Rest of the initialization code...
         if pretrain_path is not None:
             self.load_pretrain(pretrain_path)
-        else : 
+        else:
             self.net2D.load_pretrain()
             self.net3D.load_pretrain()
             self.init_conv2d()
             self.detection_head.initialize_biases()
-        
-        if freeze_bb2D == True:
-            for param in self.net2D.parameters():
-                param.require_grad = False
-            print("backbone2D freezed!")
-        
-        if freeze_bb3D == True:
-            for param in self.net3D.parameters():
-                param.require_grad = False
-            print("backbone3D freezed!")
 
     def forward(self, clips):
-        key_frames = clips[:, :, -1, :, :]
+        # Assuming clips shape: [B, C, T, H, W]
+        key_frames = clips[:, :, -1, :, :]  # [B, C, H, W]
 
         ft_2D = self.net2D(key_frames)
         ft_3D = self.net3D(clips).squeeze(2)
@@ -121,7 +122,6 @@ class YOWOv3(torch.nn.Module):
 
         ft = self.fusion(ft_2D, ft_3D)
 
-        # [B, 4 + num_classes, 1029]
         return self.detection_head(list(ft))
     
     def load_pretrain(self, pretrain_yowov3):
@@ -189,7 +189,8 @@ def build_yowov3(config):
     interchannels = config['interchannels']
     mode          = config['mode']
     pretrain_path = config['pretrain_path']
-    img_size      = config['img_size']
+    # Modified to handle rectangular input
+    img_size      = (1080, 1920)  # (height, width)
 
     try:
         freeze_bb2D   = config['freeze_bb2D']
