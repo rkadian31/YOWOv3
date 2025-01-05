@@ -75,34 +75,42 @@ class ResNeXt(nn.Module):
                  block,
                  layers,
                  shortcut_type='B',
-                 cardinality=32, pretrain_path=None):
+                 cardinality=32, 
+                 pretrain_path=None):
         self.inplanes = 64
         super(ResNeXt, self).__init__()
+        
+        # Modified first conv layer for HD resolution
         self.conv1 = nn.Conv3d(
             3,
             64,
             kernel_size=7,
-            stride=(1, 2, 2),
+            stride=(1, 2, 2),  # Reduced temporal stride
             padding=(3, 3, 3),
             bias=False)
+        
         self.bn1 = nn.BatchNorm3d(64)
         self.relu = nn.ReLU(inplace=True)
         
-        self.maxpool = nn.MaxPool3d(kernel_size=(3, 3, 3), stride=2, padding=1)
+        # Modified pooling for HD resolution
+        self.maxpool = nn.MaxPool3d(kernel_size=(1, 3, 3), 
+                                  stride=(1, 2, 2),  # Reduced temporal stride
+                                  padding=(0, 1, 1))
         
+        # Modified layers with adjusted stride for HD resolution
         self.layer1 = self._make_layer(block, 128, layers[0], shortcut_type,
-                                       cardinality)
-        
+                                     cardinality)
         self.layer2 = self._make_layer(
-            block, 256, layers[1], shortcut_type, cardinality, stride=2)
-        
+            block, 256, layers[1], shortcut_type, cardinality, stride=(1, 2, 2))
         self.layer3 = self._make_layer(
-            block, 512, layers[2], shortcut_type, cardinality, stride=2)
-        
+            block, 512, layers[2], shortcut_type, cardinality, stride=(1, 2, 2))
         self.layer4 = self._make_layer(
-            block, 1024, layers[3], shortcut_type, cardinality, stride=2)
-        self.avgpool = nn.AvgPool3d((2, 1, 1), stride=1)
+            block, 1024, layers[3], shortcut_type, cardinality, stride=(1, 2, 2))
+        
+        # Adaptive pooling for variable input sizes
+        self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
 
+        # Initialize weights
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
                 m.weight = nn.init.kaiming_normal_(m.weight, mode='fan_out')
@@ -111,6 +119,9 @@ class ResNeXt(nn.Module):
                 m.bias.data.zero_()
 
         self.pretrain_path = pretrain_path
+        
+        # Add input size validation
+        self.input_size = (1080, 1920)  # height, width
 
     def _make_layer(self,
                     block,
@@ -133,7 +144,8 @@ class ResNeXt(nn.Module):
                         planes * block.expansion,
                         kernel_size=1,
                         stride=stride,
-                        bias=False), nn.BatchNorm3d(planes * block.expansion))
+                        bias=False), 
+                    nn.BatchNorm3d(planes * block.expansion))
 
         layers = []
         layers.append(
@@ -145,6 +157,14 @@ class ResNeXt(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        # Input validation
+        if x.size(-2) != 1080 or x.size(-1) != 1920:
+            raise ValueError(f"Input spatial dimensions must be 1080x1920, got {x.size(-2)}x{x.size(-1)}")
+            
+        # Memory optimization warning
+        if x.size(0) > 2:  # Batch size > 2
+            print("Warning: Large batch size with HD resolution may cause OOM issues")
+            
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -155,69 +175,46 @@ class ResNeXt(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)
 
-        if x.size(2) == 2:
-            x = self.avgpool(x)
-
+        x = self.avgpool(x)
+        
         return x
 
-
-# def get_fine_tuning_parameters(model, ft_portion):
-#     if ft_portion == "complete":
-#         return model.parameters()
-
-#     elif ft_portion == "last_layer":
-#         ft_module_names = []
-#         ft_module_names.append('classifier')
-
-#         parameters = []
-#         for k, v in model.named_parameters():
-#             for ft_module in ft_module_names:
-#                 if ft_module in k:
-#                     parameters.append({'params': v})
-#                     break
-#             else:
-#                 parameters.append({'params': v, 'lr': 0.0})
-#         return parameters
-
-#     else:
-#         raise ValueError("Unsupported ft_portion: 'complete' or 'last_layer' expected")
-    
     def load_pretrain(self):
-        
+        if self.pretrain_path is None:
+            return
+            
         state_dict = self.state_dict()
-
         pretrain_state_dict = torch.load(self.pretrain_path)
 
         for param_name, value in pretrain_state_dict['state_dict'].items():
-            param_name = param_name.split('.', 1)[1] # param_name has 'module' at first!
+            param_name = param_name.split('.', 1)[1]
             if param_name not in state_dict:
                 continue
             state_dict[param_name] = value
             
         self.load_state_dict(state_dict)
-
         print("backbone3D : resnext pretrained loaded!", flush=True)
 
 
 def resnext50(**kwargs):
-    """Constructs a ResNet-50 model.
-    """
     model = ResNeXt(ResNeXtBottleneck, [3, 4, 6, 3], **kwargs)
     return model
 
 
 def resnext101(config):
-    """Constructs a ResNet-101 model.
-    """
-    model = ResNeXt(ResNeXtBottleneck, [3, 4, 23, 3], pretrain_path=config['BACKBONE3D']['RESNEXT']['PRETRAIN']['ver_101'])
+    model = ResNeXt(ResNeXtBottleneck, [3, 4, 23, 3], 
+                    pretrain_path=config['BACKBONE3D']['RESNEXT']['PRETRAIN']['ver_101'])
+    # Initialize with weights suitable for HD resolution
+    if model.pretrain_path is None:
+        for m in model.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
     return model
 
 
 def resnext152(**kwargs):
-    """Constructs a ResNet-101 model.
-    """
     model = ResNeXt(ResNeXtBottleneck, [3, 8, 36, 3], **kwargs)
     return model
-
-
-
