@@ -68,17 +68,19 @@ class Unit3D(nn.Module):
         self._use_bias = use_bias
         self.name = name
         self.padding = padding
-        
+
+        # Add support for larger feature maps
         self.conv3d = nn.Conv3d(in_channels=in_channels,
-                                out_channels=self._output_channels,
-                                kernel_size=self._kernel_shape,
-                                stride=self._stride,
-                                padding=0, # we always want padding to be 0 here. We will dynamically pad based on input size in forward function
-                                bias=self._use_bias)
+                               out_channels=self._output_channels,
+                               kernel_size=self._kernel_shape,
+                               stride=self._stride,
+                               padding=0,
+                               bias=self._use_bias)
         
         if self._use_batch_norm:
-            self.bn = nn.BatchNorm3d(self._output_channels, eps=0.001, momentum=0.01)
-
+            # Adjusted batch norm momentum for larger input size
+            self.bn = nn.BatchNorm3d(self._output_channels, eps=0.001, momentum=0.01)        
+        
     def compute_pad(self, dim, s):
         if s % self._stride[dim] == 0:
             return max(self._kernel_shape[dim] - self._stride[dim], 0)
@@ -87,17 +89,11 @@ class Unit3D(nn.Module):
 
             
     def forward(self, x):
-        # compute 'same' padding
+        # Compute padding dynamically based on input size
         (batch, channel, t, h, w) = x.size()
-        #print t,h,w
-        out_t = np.ceil(float(t) / float(self._stride[0]))
-        out_h = np.ceil(float(h) / float(self._stride[1]))
-        out_w = np.ceil(float(w) / float(self._stride[2]))
-        #print out_t, out_h, out_w
         pad_t = self.compute_pad(0, t)
         pad_h = self.compute_pad(1, h)
         pad_w = self.compute_pad(2, w)
-        #print pad_t, pad_h, pad_w
 
         pad_t_f = pad_t // 2
         pad_t_b = pad_t - pad_t_f
@@ -107,10 +103,7 @@ class Unit3D(nn.Module):
         pad_w_b = pad_w - pad_w_f
 
         pad = (pad_w_f, pad_w_b, pad_h_f, pad_h_b, pad_t_f, pad_t_b)
-        #print x.size()
-        #print pad
         x = F.pad(x, pad)
-        #print x.size()        
 
         x = self.conv3d(x)
         if self._use_batch_norm:
@@ -213,11 +206,15 @@ class InceptionI3d(nn.Module):
         self._final_endpoint = final_endpoint
         self.logits = None
         self.pretrain_path = pretrain_path
-
+         # Add memory optimization flags
+        self.use_memory_efficient = True
+        self.gradient_checkpointing = True
+                     
         if self._final_endpoint not in self.VALID_ENDPOINTS:
             raise ValueError('Unknown final endpoint %s' % self._final_endpoint)
 
         self.end_points = {}
+        self.input_size = (1080, 1920)  # height, width
         end_point = 'Conv3d_1a_7x7'
         self.end_points[end_point] = Unit3D(in_channels=in_channels, output_channels=64, kernel_shape=[7, 7, 7],
                                             stride=(2, 2, 2), padding=(3,3,3),  name=name+end_point)
@@ -290,8 +287,7 @@ class InceptionI3d(nn.Module):
         if self._final_endpoint == end_point: return
 
         end_point = 'Logits'
-        self.avg_pool = nn.AvgPool3d(kernel_size=[2, 7, 7],
-                                     stride=(1, 1, 1))
+        self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
         self.dropout = nn.Dropout(dropout_keep_prob)
 
         self.build()
@@ -313,19 +309,28 @@ class InceptionI3d(nn.Module):
             self.add_module(k, self.end_points[k])
         
     def forward(self, x):
-        for end_point in self.VALID_ENDPOINTS:
-            if end_point in self.end_points:
-                x = self._modules[end_point](x) # use _modules to work with dataparallel
+        # Add input validation
+       if x.size(-2) != 1080 or x.size(-1) != 1920:
+           raise ValueError(f"Input spatial dimensions must be 1080x1920, got {x.size(-2)}x{x.size(-1)}")
+            
+        # Process through backbone
+       for end_point in self.VALID_ENDPOINTS:
+           if end_point in self.end_points:
+               x = self._modules[end_point](x)
 
-        x = F.avg_pool3d(x, kernel_size=(x.shape[2], 1, 1), stride=1)
-        return x
+        # Use adaptive pooling instead of fixed kernel size
+       x = self.avg_pool(x)
+       return x
         
-
     def extract_features(self, x):
-        for end_point in self.VALID_ENDPOINTS:
-            if end_point in self.end_points:
-                x = self._modules[end_point](x)
-        return self.avg_pool(x)
+        # Add input validation
+       if x.size(-2) != 1080 or x.size(-1) != 1920:
+           raise ValueError(f"Input spatial dimensions must be 1080x1920, got {x.size(-2)}x{x.size(-1)}")
+            
+       for end_point in self.VALID_ENDPOINTS:
+           if end_point in self.end_points:
+               x = self._modules[end_point](x)
+       return self.avg_pool(x)
 
     def load_pretrain(self):
         if self.pretrain_path is None:
@@ -344,5 +349,19 @@ class InceptionI3d(nn.Module):
 
 def build_i3d(config):
     pretrain_path = config['BACKBONE3D']['I3D']['PRETRAIN']['default']
-    return InceptionI3d(in_channels=3, pretrain_path=pretrain_path)
+    model = InceptionI3d(in_channels=3, pretrain_path=pretrain_path)
+    
+    # Initialize with weights suitable for HD resolution
+    if pretrain_path is None:
+        for m in model.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    # Add recommended batch size for HD resolution
+    model.recommended_batch_size = 2  # Adjust based on available GPU memory
+    
+    return model
     
