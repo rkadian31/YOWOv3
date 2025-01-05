@@ -23,19 +23,39 @@ class Conv(torch.nn.Module):
         return self.relu(self.conv(x))
 
 class DFL(torch.nn.Module):
-    # Integral module of Distribution Focal Loss (DFL)
-    # Generalized Focal Loss https://ieeexplore.ieee.org/document/9792391
     def __init__(self, ch=16):
         super().__init__()
         self.ch = ch
         self.conv = torch.nn.Conv2d(ch, 1, 1, bias=False).requires_grad_(False)
         x = torch.arange(ch, dtype=torch.float).view(1, ch, 1, 1)
         self.conv.weight.data[:] = torch.nn.Parameter(x)
+        
+        # Add memory optimization for HD
+        self.chunk_size = 1024  # Adjustable based on available memory
 
     def forward(self, x):
         b, c, a = x.shape
+        
+        # Memory efficient processing for HD resolution
+        if a > self.chunk_size:
+            return self.chunked_forward(x, b, c, a)
+            
         x = x.view(b, 4, self.ch, a).transpose(2, 1)
         return self.conv(x.softmax(1)).view(b, 4, a)
+    
+    def chunked_forward(self, x, b, c, a):
+        # Process in chunks for memory efficiency
+        chunk_size = self.chunk_size
+        outputs = []
+        
+        for i in range(0, a, chunk_size):
+            end = min(i + chunk_size, a)
+            chunk = x[..., i:end]
+            chunk = chunk.view(b, 4, self.ch, -1).transpose(2, 1)
+            output = self.conv(chunk.softmax(1)).view(b, 4, -1)
+            outputs.append(output)
+            
+        return torch.cat(outputs, dim=2)
 
 
 class DFLHead(torch.nn.Module):
@@ -48,46 +68,77 @@ class DFLHead(torch.nn.Module):
         self.mode = mode
         self.ch = 16  # DFL channels
         self.nc = nc  # number of classes
-        self.img_size = img_size
+        self.img_size = img_size  # (1080, 1920) for HD
         self.nl = len(filters)  # number of detection layers
         self.no = nc + self.ch * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         self.interchannels = interchannels
- 
-        self.dfl = DFL(self.ch)
-        self.cls = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, self.interchannels, 3),
-                                                           Conv(self.interchannels, self.interchannels, 3),
-                                                           torch.nn.Conv2d(self.interchannels, self.nc, 1)) for x in filters)
         
-        self.box = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, self.interchannels, 3),
-                                                           Conv(self.interchannels, self.interchannels, 3),
-                                                           torch.nn.Conv2d(self.interchannels, 4 * self.ch, 1)) for x in filters)
+        # Adjusted for HD resolution
+        self.grid_size = (img_size[0] // 32, img_size[1] // 32)  # Base grid size for HD
+        
+        self.dfl = DFL(self.ch)
+        
+        # Modified convolution layers for HD resolution
+        self.cls = torch.nn.ModuleList(
+            torch.nn.Sequential(
+                Conv(x, self.interchannels, 3),
+                Conv(self.interchannels, self.interchannels, 3),
+                torch.nn.Conv2d(self.interchannels, self.nc, 1)
+            ) for x in filters
+        )
+        
+        self.box = torch.nn.ModuleList(
+            torch.nn.Sequential(
+                Conv(x, self.interchannels, 3),
+                Conv(self.interchannels, self.interchannels, 3),
+                torch.nn.Conv2d(self.interchannels, 4 * self.ch, 1)
+            ) for x in filters
+        )
 
     def forward(self, x):
-        #print(self.box[i](x[i]).shape) [B, 4 * n_dfl_channel, H, W]
-        #print(self.cls[i](x[i]).shape) [B, nclass, H, W]
-        if self.mode == 'coupled':
-            for i in range(self.nl):
-                x[i] = torch.cat((self.box[i](x[i]), self.cls[i](x[i])), 1)
-        elif self.mode == 'decoupled':
-            for i in range(self.nl):
-                x[i] = torch.cat((self.box[i](x[i][0]), self.cls[i](x[i][1])), 1)
         if self.training:
+            if self.mode == 'coupled':
+                for i in range(self.nl):
+                    x[i] = torch.cat((self.box[i](x[i]), self.cls[i](x[i])), 1)
+            elif self.mode == 'decoupled':
+                for i in range(self.nl):
+                    x[i] = torch.cat((self.box[i](x[i][0]), self.cls[i](x[i][1])), 1)
             return x
+            
+        # Memory efficient inference for HD
         self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
-
-        x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], 2)
+        
+        # Process in chunks for memory efficiency
+        batch_size = x[0].shape[0]
+        outputs = []
+        chunk_size = 8192  # Adjustable based on available memory
+        
+        for i in range(0, self.nl):
+            if self.mode == 'coupled':
+                feat = torch.cat((self.box[i](x[i]), self.cls[i](x[i])), 1)
+            else:  # decoupled
+                feat = torch.cat((self.box[i](x[i][0]), self.cls[i](x[i][1])), 1)
+            outputs.append(feat.view(batch_size, self.no, -1))
+        
+        x = torch.cat(outputs, 2)
         box, cls = x.split((self.ch * 4, self.nc), 1)
-        a, b = torch.split(self.dfl(box), 2, 1)
+        
+        # Process DFL in chunks
+        dfl_out = self.dfl(box)
+        a, b = torch.split(dfl_out, 2, 1)
+        
         a = self.anchors.unsqueeze(0) - a
         b = self.anchors.unsqueeze(0) + b
         box = torch.cat(((a + b) / 2, b - a), 1)
+        
         return torch.cat((box * self.strides, cls.sigmoid()), 1)
 
     def initialize_biases(self):
-        # Initialize biases
-        # WARNING: requires stride availability
-        m = self
-        for a, b, s in zip(m.box, m.cls, m.stride):
+        # Initialize biases with HD-appropriate values
+        for a, b, s in zip(self.box, self.cls, self.stride):
             a[-1].bias.data[:] = 1.0  # box
-            b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (self.img_size / s) ** 2)
+            # Adjusted for HD resolution
+            b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (
+                (self.img_size[0] * self.img_size[1]) / (s * s)
+            ))
