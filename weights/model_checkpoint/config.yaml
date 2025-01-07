@@ -119,7 +119,7 @@ FUSION:
 
 
 config_path       : config/ucf_config.yaml
-dataset           : ucf
+dataset           : custom
 loss              : tal
 active_checker    : True
 num_classes       : 224
